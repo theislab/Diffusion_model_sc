@@ -60,214 +60,11 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms, utils, io
 from torchvision.datasets.utils import verify_str_arg
 
+import cellrank as cr
+import scanpy as sc
+import scvelo as scv
+
 FLAGS = flags.FLAGS
-
-class CelebADataset(Dataset):
-    """CelebA Dataset class"""
-
-    def __init__(self,
-                 root,
-                 split="train",
-                 target_type="attr",
-                 transform=None,
-                 target_transform=None,
-                 download=False
-                 ):
-        """
-        """
-
-        self.root = root
-        self.split = split
-        self.target_type = target_type
-        self.transform = transform
-        self.target_transform = target_transform
-
-        if isinstance(target_type, list):
-            self.target_type = target_type
-        else:
-            self.target_type = [target_type]
-
-        if not self.target_type and self.target_transform is not None:
-            raise RuntimeError('target_transform is specified but target_type is empty')
-
-        if download:
-            self.download_from_kaggle()
-
-        split_map = {
-            "train": 0,
-            "valid": 1,
-            "test": 2,
-            "all": None,
-        }
-
-        split_ = split_map[verify_str_arg(split.lower(), "split", ("train", "valid", "test", "all"))]
-
-        fn = partial(os.path.join, self.root)
-        splits = pd.read_csv(fn("list_eval_partition.csv"), delim_whitespace=False, header=0, index_col=0)
-        # This file is not available in Kaggle
-        # identity = pd.read_csv(fn("identity_CelebA.csv"), delim_whitespace=True, header=None, index_col=0)
-        bbox = pd.read_csv(fn("list_bbox_celeba.csv"), delim_whitespace=False, header=0, index_col=0)
-        landmarks_align = pd.read_csv(fn("list_landmarks_align_celeba.csv"), delim_whitespace=False, header=0,
-                                      index_col=0)
-        attr = pd.read_csv(fn("list_attr_celeba.csv"), delim_whitespace=False, header=0, index_col=0)
-
-        mask = slice(None) if split_ is None else (splits['partition'] == split_)
-
-        self.filename = splits[mask].index.values
-        # self.identity = torch.as_tensor(identity[mask].values)
-        self.bbox = torch.as_tensor(bbox[mask].values)
-        self.landmarks_align = torch.as_tensor(landmarks_align[mask].values)
-        self.attr = torch.as_tensor(attr[mask].values)
-        self.attr = (self.attr + 1) // 2  # map from {-1, 1} to {0, 1}
-        self.attr_names = list(attr.columns)
-
-    def download_from_kaggle(self):
-
-        # Annotation files will be downloaded at the end
-        label_files = ['list_attr_celeba.csv', 'list_bbox_celeba.csv', 'list_eval_partition.csv',
-                       'list_landmarks_align_celeba.csv']
-
-        # Check if files have been downloaded already
-        files_exist = False
-        for label_file in label_files:
-            if os.path.isfile(os.path.join(self.root, label_file)):
-                files_exist = True
-            else:
-                files_exist = False
-
-        if files_exist:
-            print("Files exist already")
-        else:
-            print("Downloading dataset. Please while while the download and extraction processes complete")
-            # Download files from Kaggle using its API as per
-            # https://stackoverflow.com/questions/55934733/documentation-for-kaggle-api-within-python
-
-            # Kaggle authentication
-            # Remember to place the API token from Kaggle in $HOME/.kaggle
-            from kaggle.api.kaggle_api_extended import KaggleApi
-            api = KaggleApi()
-            api.authenticate()
-
-            # Download all files of a dataset
-            # Signature: dataset_download_files(dataset, path=None, force=False, quiet=True, unzip=False)
-            api.dataset_download_files(dataset='jessicali9530/celeba-dataset',
-                                       path=self.root,
-                                       unzip=True,
-                                       force=False,
-                                       quiet=False)
-
-            # Downoad the label files
-            # Signature: dataset_download_file(dataset, file_name, path=None, force=False, quiet=True)
-            for label_file in label_files:
-                api.dataset_download_file(dataset='jessicali9530/celeba-dataset',
-                                          file_name=label_file,
-                                          path=self.root,
-                                          force=False,
-                                          quiet=False)
-
-            # Clear any remaining *.csv.zip files
-            files_to_delete = glob.glob(os.path.join(self.root, "*.csv.zip"))
-            for f in files_to_delete:
-                os.remove(f)
-
-            print("Done!")
-
-    def __getitem__(self, index: int):
-        X = PIL.Image.open(os.path.join(self.root,
-                                        "img_align_celeba",
-                                        "img_align_celeba",
-                                        self.filename[index]))
-
-        target = []
-        for t in self.target_type:
-            if t == "attr":
-                target.append(self.attr[index, :])
-            # elif t == "identity":
-            #     target.append(self.identity[index, 0])
-            elif t == "bbox":
-                target.append(self.bbox[index, :])
-            elif t == "landmarks":
-                target.append(self.landmarks_align[index, :])
-            else:
-                raise ValueError(f"Target type {t} is not recognized")
-
-        if self.transform is not None:
-            X = self.transform(X)
-
-        if target:
-            target = tuple(target) if len(target) > 1 else target[0]
-
-            if self.target_transform is not None:
-                target = self.target_transform(target)
-        else:
-            target = None
-
-        return X, target
-
-    def __len__(self) -> int:
-        return len(self.attr)
-
-class GaussianBlur(object):
-    """blur a single image on CPU"""
-    def __init__(self, kernel_size):
-        radias = kernel_size // 2
-        kernel_size = radias * 2 + 1
-        self.blur_h = nn.Conv2d(3, 3, kernel_size=(kernel_size, 1),
-                                stride=1, padding=0, bias=False, groups=3)
-        self.blur_v = nn.Conv2d(3, 3, kernel_size=(1, kernel_size),
-                                stride=1, padding=0, bias=False, groups=3)
-        self.k = kernel_size
-        self.r = radias
-
-        self.blur = nn.Sequential(
-            nn.ReflectionPad2d(radias),
-            self.blur_h,
-            self.blur_v
-        )
-
-        self.pil_to_tensor = transforms.ToTensor()
-        self.tensor_to_pil = transforms.ToPILImage()
-
-    def __call__(self, img):
-        img = self.pil_to_tensor(img).unsqueeze(0)
-
-        sigma = np.random.uniform(0.1, 2.0)
-        x = np.arange(-self.r, self.r + 1)
-        x = np.exp(-np.power(x, 2) / (2 * sigma * sigma))
-        x = x / x.sum()
-        x = torch.from_numpy(x).view(1, -1).repeat(3, 1)
-
-        self.blur_h.weight.data.copy_(x.view(3, 1, self.k, 1))
-        self.blur_v.weight.data.copy_(x.view(3, 1, 1, self.k))
-
-        with torch.no_grad():
-            img = self.blur(img)
-            img = img.squeeze()
-
-        img = self.tensor_to_pil(img)
-
-        return img
-
-channel_stats = {
-    'cifar10': dict(mean=[0.4914, 0.4822, 0.4465],
-                         std=[0.2470, 0.2435, 0.2616]),
-    'cifar100': dict(mean=[0.5071, 0.4867, 0.4408],
-                         std=[0.2675, 0.2565, 0.2761]),
-    'mini_imgnet': dict(mean=[x / 255.0 for x in [120.39586422, 115.59361427, 104.54012653]],
-                        std=[x / 255.0 for x in [70.68188272, 68.27635443, 72.54505529]])
-}
-
-sizes = {
-    'cifar10': 32,
-    'cifar100': 32,
-    'mini_imgnet': 84
-}
-
-padding = {
-    'cifar10': 4,
-    'cifar100': 4,
-    'mini_imgnet': 8
-}
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -278,105 +75,60 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
 
-def get_transforms(dataset, aug):
-    if dataset == 'synthetic' or dataset == 'cmnist':
-        return transforms.ToTensor()
+class CellDataloader(Dataset): # to-do
+    """Single-cell dataloader
+    """
 
-    if dataset == 'celeba':
-        return transforms.Compose([
-            transforms.Resize([64, 64]),
-            transforms.ToTensor()
-        ])
+    def __init__(self,
+                 path: str,
+                 key: bool) -> None:
+        """
+        Args:
+            path (str): path to the .h5ad file to open
+            key (bool): Train (True) / Test (False)
+        """
+        super().__init__()
 
-    size = sizes[dataset]
-    pad = padding[dataset]
-    stats = channel_stats[dataset]
-    if aug == 'none':
-        transform = transforms.Compose([transforms.ToTensor(),
-                                         transforms.Normalize(**stats)])
-    elif aug == 'simclr':
-        color_jitter = transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
-        transform = transforms.Compose([transforms.RandomResizedCrop(size=size),
-                                              transforms.RandomHorizontalFlip(),
-                                              transforms.RandomApply([color_jitter], p=0.8),
-                                              transforms.RandomGrayscale(p=0.2),
-                                              GaussianBlur(kernel_size=int(0.1 * size)),
-                                              transforms.ToTensor(),
-                                              transforms.Normalize(**stats)])
-    elif aug == 'laplace_strong':
-        transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(size, padding=pad, padding_mode="reflect"),
-            RandAugment(2),
-            transforms.ToTensor(),
-            transforms.Normalize(**stats)
-        ])
-    elif aug == 'laplace_weak':
-        transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(size, padding=pad, padding_mode="reflect"),
-            RandAugment(1),
-            transforms.ToTensor(),
-            transforms.Normalize(**stats)
-        ])
-    else:
-        print('No Augmentation Found')
-        exit()
+        self.path = path
+        self.key = key
 
-    return transform
+        if self.path == None:
+            adata = cr.datasets.pancreas()
+        else:
+            adata = sc.read(path)
 
-def get_dataloaders(dataset, bsz, aug='none'):
-    transform = get_transforms(dataset, aug)
-    if dataset == 'cifar10':
-        train_data = torchvision.datasets.ImageFolder(
-            root = './data/images/cifar/cifar10/by-image/train+val',
-            transform = transform
-        )
-        test_data = torchvision.datasets.ImageFolder(
-            root = './data/images/cifar/cifar10/by-image/test',
-            transform = transform
-        )
-    elif dataset == 'cifar100':
-        train_data = torchvision.datasets.ImageFolder(
-            root = './data/images/cifar/cifar100/by-image/train+val',
-            transform = transform
-        )
-        test_data = torchvision.datasets.ImageFolder(
-            root = './data/images/cifar/cifar100/by-image/test',
-            transform = transform
-        )
-    elif dataset == 'mini_imgnet':
-        train_data = torchvision.datasets.ImageFolder(
-            root = './data/images/miniimagenet/train',
-            transform = transform
-        )
-        test_data = torchvision.datasets.ImageFolder(
-            root = './data/images/miniimagenet/test',
-            transform = transform
-        )
-    elif dataset == 'synthetic':
-        train_x = torch.Tensor(np.load('./data/synthetic/train_imgs.npy', allow_pickle=True))
-        train_y = torch.Tensor(np.load('./data/synthetic/train_labels.npy', allow_pickle=True))
-        test_x = torch.Tensor(np.load('./data/synthetic/test_imgs.npy', allow_pickle=True))
-        test_y = torch.Tensor(np.load('./data/synthetic/test_labels.npy', allow_pickle=True))
+        scv.pp.filter_and_normalize(adata, min_shared_counts=20, n_top_genes=2000)
 
-        train_data = torch.utils.data.TensorDataset(train_x, train_y)
-        test_data = torch.utils.data.TensorDataset(test_x, test_y)
-    elif dataset == 'cmnist':
-        train_x = torch.Tensor(np.load('./data/cmnist/train_imgs.npy', allow_pickle=True))
-        train_y = torch.Tensor(np.load('./data/cmnist/train_labels.npy', allow_pickle=True))
-        test_x = torch.Tensor(np.load('./data/cmnist/test_imgs.npy', allow_pickle=True))
-        test_y = torch.Tensor(np.load('./data/cmnist/test_labels.npy', allow_pickle=True))
+        self.data = adata.X
+        self.cell_type = adata.obs.clusters
 
-        train_data = torch.utils.data.TensorDataset(train_x, train_y)
-        test_data = torch.utils.data.TensorDataset(test_x, test_y)
-    elif dataset == 'celeba':
-        train_data = CelebADataset('./data/celeba/', split='train',
-                                                 transform = transform,
-                                                 download=True)
-        test_data = CelebADataset('./data/celeba/', split='test',
-                                                 transform=transform,
-                                                download=True)
+    def __getitem__(self, i):
+        """Function to get the items asked by the dataloader. It returns an index, two cells belonging to the same metacell, and the cell type.
+        Args:
+            i (int): query by the dataloader. The dataloader ask for i=0 to i=len(dataset)
+        Returns:
+            subgraph (torch_geometric.Data): 
+        """
+
+        cell = self.data.A[i,:]
+
+        return cell, self.cell_type[i]
+
+    def __len__(self):
+        return self.data.shape[0]
+
+
+
+def get_dataloaders(dataset, bsz):
+    if dataset == 'pancreas':
+        train_data = CellDataloader(
+            path = None,
+            key = True
+        )
+        test_data = CellDataloader(
+            path = None,
+            key = False
+        )
     else:
         print('Dataset Not Supported')
         exit()
@@ -414,7 +166,6 @@ def train(config, workdir):
     logging.info(tf.config.list_physical_devices('GPU'))
     set_seed(config.training.seed)
     print(f"Dataset: {config.data.dataset}")
-    print(f"Augmentations: {config.data.aug}")
     print(f"Seed: {config.training.seed}")
     print(f"Widen Factor: {config.model.widen_factor}")
     print(f"Regularizer: {config.training.lambda_z}")
@@ -426,17 +177,10 @@ def train(config, workdir):
 
     args = cli.parse_commandline_args()
     args.dataset = config.data.dataset
-    if args.dataset == 'mini_imgnet':
-        config.data.image_size = 84
-        config.model.ch_mult = (1, 2, 2)
-    elif args.dataset == 'celeba':
-        config.data.image_size = 64
-        config.model.ch_mult = (1, 2, 2)
     # args = helpers.load_args(args)
-    dataset_config = datasets_new.__dict__[args.dataset]()
-    num_classes = dataset_config.pop('num_classes')
+    num_classes = 7
     args.num_classes = num_classes
-    train_loader, eval_loader = get_dataloaders(args.dataset, args.batch_size, config.data.aug)
+    train_loader, eval_loader = get_dataloaders(args.dataset, args.batch_size)
 
     train_iter = iter(cycle(train_loader))
     eval_iter = iter(cycle(eval_loader))
@@ -486,12 +230,6 @@ def train(config, workdir):
                                       reduce_mean=reduce_mean, continuous=continuous,
                                       likelihood_weighting=likelihood_weighting, config=config)
 
-    # Building sampling functions
-    if config.training.snapshot_sampling:
-        sampling_shape = (config.training.batch_size, config.data.num_channels,
-                          config.data.image_size, config.data.image_size)
-        sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
-
     num_train_steps = config.training.n_iters
 
     # In case there are multiple hosts (e.g., TPU pods), only log to host 0
@@ -528,26 +266,6 @@ def train(config, workdir):
             if getattr(config.training, 'include_encoder', False):
                 encoder_state = state['model'].module.encoder.state_dict()
                 torch.save(encoder_state, os.path.join(checkpoint_enc_dir, f'encoder_state_{save_step}.pth'))
-
-            # Generate and save samples
-            if config.training.snapshot_sampling and step > 0:
-                ema.store(score_model.parameters())
-                ema.copy_to(score_model.parameters())
-                sample, n = sampling_fn(score_model)
-                ema.restore(score_model.parameters())
-                this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
-                tf.io.gfile.makedirs(this_sample_dir)
-                nrow = int(np.sqrt(sample.shape[0]))
-                image_grid = make_grid(sample, nrow, padding=2)
-                sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
-                with tf.io.gfile.GFile(
-                        os.path.join(this_sample_dir, "sample.np"), "wb") as fout:
-                    np.save(fout, image_grid.cpu().numpy()) # sample)
-
-                with tf.io.gfile.GFile(
-                        os.path.join(this_sample_dir, "sample.png"), "wb") as fout:
-                    save_image(image_grid, fout)
-
 
 def evaluate(config,
              workdir,
